@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+import functools
 import warnings
 from typing import Optional, Union
 
@@ -138,9 +138,10 @@ def get_gpt_layer_with_inference_spec(
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                self_attention=ModuleSpec(
-                    module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                # To fix type hinting, simply swap ModuleSpec for functools.partial.
+                self_attention=functools.partial(
+                    SelfAttention,
+                    attn_mask_type=AttnMaskType.causal,
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_layer_norm_linear(),
                         core_attention=backend.core_attention(),
@@ -240,6 +241,9 @@ def get_gpt_layer_with_transformer_engine_spec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=backend.layer_norm(),
+                # ModuleSpec is still legal to provide and does not trigger a type error - it is
+                # callable with any arguments, so inherently matches any Builder Protocol. (It
+                # doesn't get type-checked, though, so doesn't *benefit* from the Protocol.)
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},

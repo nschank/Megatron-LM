@@ -317,7 +317,9 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.core.transformer.transformer_layer import (
+            get_transformer_layer_offset,
+        )
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -708,6 +710,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        # TODO(nschank): This parameter is inconsistently either an int or a Tensor in various places
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -1022,9 +1025,9 @@ class SelfAttention(Attention):
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: Optional[str] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(
             config=config,

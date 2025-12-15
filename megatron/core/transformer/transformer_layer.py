@@ -4,13 +4,13 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Protocol, Tuple, Union, cast
 
 import torch
 import torch.distributed
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel, typed_torch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -191,6 +191,37 @@ def get_transformer_layer_offset(
     return offset
 
 
+class SelfAttention(Protocol):
+    def forward(
+        self,
+        input_layernorm_output: Tensor,
+        /,
+        *,
+        attention_mask: Tensor,
+        inference_context: Optional[Any],
+        rotary_pos_emb: Optional[Tensor],
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        sequence_len_offset: Optional[int],
+    ) -> Tuple[Tensor, Tensor]: ...
+
+
+class SelfAttentionBuilder(Protocol):
+    """Protocol for building SelfAttention modules."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        pg_collection: ProcessGroupCollection,
+        cp_comm_type: Optional[str] = None,
+    ) -> SelfAttention: ...
+
+
 @dataclass
 class TransformerLayerSubmodules:
     """
@@ -220,7 +251,7 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-    self_attention: Union[ModuleSpec, type] = IdentityOp
+    self_attention: SelfAttentionBuilder = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
@@ -298,10 +329,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
 
         # [Module 2: SelfAttention]
-        self.self_attention = build_module(
-            submodules.self_attention,
+        self.self_attention = submodules.self_attention(
             config=self.config,
             layer_number=self.layer_number,
+            # TODO(nschank): Remove this when cross_attention also uses a builder protocol.
             **attention_optional_kwargs,
         )
 
@@ -382,6 +413,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 ):
                     self.recompute_input_layernorm = True
                     if self.config.fp8 or self.config.fp4:
+                        # TODO(nschank): For optional things like this, you could maybe use a
+                        # Protocol to check for the method instead of isinstance checks to make
+                        # checking friendlier.
                         self.self_attention.set_for_recompute_input_layernorm()
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
@@ -496,8 +530,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
+        # TODO(nschank): attention_mask and sequence_len_offset have type errors.
+        attention_output_with_bias = typed_torch.apply_module(self.self_attention)(
+            cast(Tensor, input_layernorm_output),
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,

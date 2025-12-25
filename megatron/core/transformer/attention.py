@@ -23,7 +23,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -167,6 +169,41 @@ class LinearLayerBuilder(Protocol):
     ) -> LinearLayer: ...
 
 
+class CoreAttention(Protocol):
+    """Protocol for core_attention modules."""
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: Optional[ProcessGroupCollection],
+    ) -> CoreAttention: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -174,7 +211,7 @@ class SelfAttentionSubmodules:
     """
 
     linear_qkv: LinearQkvBuilder
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -188,7 +225,7 @@ class CrossAttentionSubmodules:
 
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -272,8 +309,7 @@ class Attention(MegatronModule, ABC):
             tmp_config.num_query_groups = world_size
         else:
             tmp_config = self.config
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = submodules.core_attention(
             config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -341,7 +377,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -380,7 +416,9 @@ class Attention(MegatronModule, ABC):
         ), "Virtual pipeline parallelism is not supported for inference"
 
         # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.core.transformer.transformer_layer import (
+            get_transformer_layer_offset,
+        )
 
         return get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
@@ -399,7 +437,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
         Returns the full size keys and values from the provided inference_context, as well as
@@ -1016,7 +1054,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
+                core_attn_out = apply_module(self.core_attention)(
                     query,
                     key,
                     value,

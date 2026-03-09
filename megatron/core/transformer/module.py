@@ -168,6 +168,11 @@ class GraphableMegatronModule(MegatronModule):
 
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
+        # When True, bypasses all CUDA graph paths and runs the forward pass eagerly.
+        # This is used to ensure metric collection calls inside forward() are executed,
+        # since CUDA graph replay skips forward() entirely.
+        self._force_eager: bool = False
+
         # Enable cuda graphs.
         if (
             config.cuda_graph_impl == "local"
@@ -225,6 +230,20 @@ class GraphableMegatronModule(MegatronModule):
         if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
             return
         self.cuda_graphs[cg_index].backward_dw()
+
+    def set_force_eager(self, force_eager: bool) -> None:
+        """Enable or disable forced eager execution for this module.
+
+        When enabled, all CUDA graph capture/replay paths are bypassed and
+        ``forward()`` runs eagerly.  This is used, for example, to ensure that
+        metric-collection calls embedded in ``forward()`` are actually executed
+        (CUDA graph replay would otherwise skip them).
+
+        Args:
+            force_eager: If ``True``, bypass CUDA graphs; if ``False``, restore
+                normal CUDA graph behaviour.
+        """
+        self._force_eager = force_eager
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -343,9 +362,9 @@ class GraphableMegatronModule(MegatronModule):
         )
 
     def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
+        if not self._force_eager and self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
-        elif self._should_call_te_cudagraph(*args, **kwargs):
+        elif not self._force_eager and self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._te_cuda_graph_capture
